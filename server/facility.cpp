@@ -73,7 +73,7 @@ class facility {
                     booking.saveToDatabase(); // Save failed booking to database
                     // Return 1 to indicate failure
                     bookings.push_back(booking);
-                    return {1, "Booking conflict detected!"};
+                    return {(uint8_t)1, "Booking conflict detected!"};
                 }
             }
             booking.bookingStatus = booked;

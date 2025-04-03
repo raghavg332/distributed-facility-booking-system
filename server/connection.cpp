@@ -12,7 +12,25 @@
 #include <thread>
 #include <map>
 #include <csignal>
+#include <random>
+#include <iostream>
+#include <string>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <errno.h>
 
+std::string generate6DigitCode() {
+    std::random_device rd;  // non-deterministic generator
+    std::mt19937 gen(rd()); // Mersenne Twister RNG
+    std::uniform_int_distribution<> dist(0, 999999);
+
+    int code = dist(gen);
+    
+    // Pad with leading zeros to make it 6 digits
+    char buffer[7]; // 6 digits + null terminator
+    snprintf(buffer, sizeof(buffer), "%06d", code);
+    return std::string(buffer);
+}
 
 
 
@@ -37,13 +55,15 @@ struct MonitorClients {
 
 std::unordered_multimap<std::string, MonitorClients> clients;
 
+std::unordered_multimap<std::string, std::unordered_map<uint32_t, std::string>> prevRequestData;
+
 class Connection {
     public :
         int socket_fd;
         sockaddr_in serverAddress, clientAddress;
         socklen_t clientAddressLength = sizeof(clientAddress);
         unsigned char buffer[1024];
-        Connection(int port = 8000):buffer{0} {
+        Connection(int port = 8014):buffer{0} {
             socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
             serverAddress.sin_family = AF_INET;
             serverAddress.sin_port = htons(port);
@@ -62,17 +82,55 @@ class Connection {
         }
         void listen() {
             while (running) {
+
+                int flags = fcntl(socket_fd, F_GETFL, 0);
+                fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
+
                 memset(buffer, 0, sizeof(buffer));
+
                 int n = recvfrom(socket_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&clientAddress, &clientAddressLength);
                 if (n < 0) {
-                    std::cerr << "Receive failed" << std::endl;
+                    if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                        // No data available, check if we should exit
+                        if (!running) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        continue;
+                    } else {
+                        std::cerr << "Receive failed: " << strerror(errno) << std::endl;
+                    }
                 }
-                std::cout << "Received: " << buffer << std::endl;
+                char ipStr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &(clientAddress.sin_addr), ipStr, INET_ADDRSTRLEN);
+                std::cout << "Received packet from " << ipStr << ":" << ntohs(clientAddress.sin_port) << std::endl;
+
+        
                 // sendto(socket_fd, buffer, n, 0, (struct sockaddr *)&clientAddress, clientAddressLength);
                 Message msg(buffer, n);
                 std::cout << "Request Type: " << (int)msg.msg.requestType << std::endl;
                 std::cout << "Request ID: " << msg.msg.requestID << std::endl;
                 std::cout << "Choice: " << (int)msg.msg.choice << std::endl;
+                auto prevRequestsFromIP = prevRequestData.equal_range(ipStr);
+                bool sent = false;
+                for (auto it = prevRequestsFromIP.first; it != prevRequestsFromIP.second; ++it) {
+                    auto& responseMap = it->second;
+
+                    auto found  = responseMap.find(msg.msg.requestID);
+                    if (found != responseMap.end()) {
+                        std::string responseStr = found->second;
+                        const char* response = responseStr.c_str();
+                        std::cout << "Found previous response for request ID: " << msg.msg.requestID << std::endl;
+                        sendto(socket_fd, response, responseStr.size(), 0, (struct sockaddr *)&clientAddress, clientAddressLength);
+                        std::cout << "Sent previous response to client" << std::endl;
+                        sent = true;
+                        continue;
+                    }
+
+                }
+                if (sent) {
+                    std::cout << "Previous response sent" << std::endl;
+                    continue;
+                }
+                std::cout << "Received: " << buffer << std::endl;
                 uint32_t facilityNameLength;
                 std::string facilityName;
                 switch ((int)msg.msg.choice)
@@ -119,6 +177,9 @@ class Connection {
                         }
                     }
                     auto [total_length, replyBuffer] = msg.createReply(data);
+                    std::unordered_map<uint32_t, std::string> responseMap;
+                    responseMap[msg.msg.requestID] = std::string(replyBuffer, total_length);
+                    prevRequestData.emplace(ipStr, responseMap);
                     sendto(socket_fd, replyBuffer, total_length, 0, (struct sockaddr *)&clientAddress, clientAddressLength);
                     break;
                 }
@@ -177,6 +238,9 @@ class Connection {
                     data.insert(data.end(), (unsigned char*)&bookingResultLength, (unsigned char*)&bookingResultLength + sizeof(bookingResultLength));
                     data.insert(data.end(), bookingResult.begin(), bookingResult.end());
                     auto [total_length, replyBuffer] = msg.createReply(data);
+                    std::unordered_map<uint32_t, std::string> responseMap;
+                    responseMap[msg.msg.requestID] = std::string(replyBuffer, total_length);
+                    prevRequestData.emplace(ipStr, responseMap);
                     sendto(socket_fd, replyBuffer, total_length, 0, (struct sockaddr *)&clientAddress, clientAddressLength);
                     break;
                 }
@@ -240,6 +304,9 @@ class Connection {
                     data.push_back((unsigned char)retrievedBooking.bookingEndMinute);
 
                     auto [totallength, buffer] = msg.createReply(data, changeStatus);
+                    std::unordered_map<uint32_t, std::string> responseMap;
+                    responseMap[msg.msg.requestID] = std::string(buffer, totallength);
+                    prevRequestData.emplace(ipStr, responseMap);
                     sendto(socket_fd, buffer, totallength, 0, (struct sockaddr *)&clientAddress, clientAddressLength);
                     std::cout << "Reply sent" << std::endl;
                     break;
@@ -270,15 +337,162 @@ class Connection {
                     data.insert(data.end(), message.begin(), message.end());
                     auto [totallength, replybuffer] = msg.createReply(data);
                     std::cout << "Sending notification to client" << std::endl;
+                    std::unordered_map<uint32_t, std::string> responseMap;
+                    responseMap[msg.msg.requestID] = std::string(replybuffer, totallength);
+                    prevRequestData.emplace(ipStr, responseMap);
                     sendto(socket_fd, replybuffer, totallength, 0,
                            (struct sockaddr *)&clientAddress, clientAddressLength);
                     std::cout << "Reply sent" << std::endl;
+                }
+                case 5: {
+                    int offset = 0;
+                    uint32_t userNameLength;
+                    memcpy(&userNameLength, msg.msg.messageData.data(), sizeof(userNameLength));
+                    userNameLength = ntohl(userNameLength);
+                    offset += sizeof(userNameLength);
+                    std::string userName = std::string((char*)msg.msg.messageData.data() + offset, static_cast<size_t>(userNameLength));
+                    offset += userNameLength;
+                    std::cout << "User Name Length: " << userNameLength << std::endl;
+                    std::cout << "User Name: " << userName << std::endl;
+                    
+
+                    pqxx::connection conn("dbname=facilitydb user=parmatmasingh password=aishi2705 host=localhost port=5432");
+                    if (conn.is_open()) {
+                        std::cout << "Connected to database" << std::endl;
+                    } else {
+                        std::cerr << "Failed to connect to database" << std::endl;
+                        return;
+                    }
+                    pqxx::work txn(conn);
+                    std::string query = "SELECT * FROM booking b, facility f where b.facility_id = f.facility_id and b.username = '" + userName + "';";
+                    std::cout << "Query: " << query << std::endl;
+                    pqxx::result res = txn.exec(query);
+                    
+                    std::vector<unsigned char> data;
+
+                    // Booking count (assumes not more than 255 bookings)
+                    data.push_back((unsigned char)res.size());
+                    std::cout << "Number of bookings: " << res.size() << std::endl;
+                    
+                    for (const auto& row : res) {
+                        // Extract time info
+                        unsigned char day      = (unsigned char)row["start_day"].as<int>();
+                        unsigned char shour    = (unsigned char)row["start_hour"].as<int>();
+                        unsigned char sminute  = (unsigned char)row["start_minute"].as<int>();
+                        unsigned char ehour    = (unsigned char)row["end_hour"].as<int>();
+                        unsigned char eminute  = (unsigned char)row["end_minute"].as<int>();
+                    
+                        data.push_back(day);
+                        data.push_back(shour);
+                        data.push_back(sminute);
+                        data.push_back(ehour);
+                        data.push_back(eminute);
+                        
+                        std::string bookingId = row["booking_id"].as<std::string>();
+                        data.push_back((unsigned char)bookingId.size());
+                        std::cout << "Booking ID Length: " << bookingId.size() << std::endl;
+                        data.insert(data.end(), bookingId.begin(), bookingId.end());
+                        std::cout << "Booking ID: " << bookingId << std::endl;
+                        
+                        std::string facilityName = row["facility_name"].as<std::string>();
+                        data.push_back((unsigned char)facilityName.size());
+                        data.insert(data.end(), facilityName.begin(), facilityName.end());
+                        std::cout << "Facility Name: " << facilityName << std::endl; 
+                    }
+                    
+                    // Package + send reply
+                    auto [total_length, replyBuffer] = msg.createReply(data);
+                    std::unordered_map<uint32_t, std::string> responseMap;
+                    responseMap[msg.msg.requestID] = std::string(replyBuffer, total_length);
+                    prevRequestData.emplace(ipStr, responseMap);
+                    sendto(socket_fd, replyBuffer, total_length, 0, (struct sockaddr *)&clientAddress, clientAddressLength);
+                    break;
+                }
+
+                case 6: {
+                    int offset = 0;
+                    uint32_t userNameLength;
+                    memcpy(&userNameLength, msg.msg.messageData.data(), sizeof(userNameLength));
+                    userNameLength = ntohl(userNameLength);
+                    offset += sizeof(userNameLength);
+                    std::string userName = std::string((char*)msg.msg.messageData.data() + offset, static_cast<size_t>(userNameLength));
+                    offset += userNameLength;
+                    std::cout << "User Name Length: " << userNameLength << std::endl;
+                    std::cout << "User Name: " << userName << std::endl;
+
+                    uint32_t confirmationId;
+                    memcpy(&confirmationId, msg.msg.messageData.data() + offset, sizeof(confirmationId));
+                    confirmationId = ntohl(confirmationId);
+                    std::cout << "Confirmation ID: " << (int)confirmationId << std::endl;
+                    offset += sizeof(confirmationId);
+
+                    pqxx::connection conn("dbname=facilitydb user=parmatmasingh password=aishi2705 host=localhost port=5432");
+                    if (conn.is_open()) {
+                        std::cout << "Connected to database" << std::endl;
+                    } else {
+                        std::cerr << "Failed to connect to database" << std::endl;
+                        return;
+                    }
+                    pqxx::work txn(conn);
+                    std::string query = "SELECT 1 FROM booking WHERE booking_id = '" + std::to_string(confirmationId) + "' and username = '" + userName + "';";
+                    std::cout << "Query: " << query << std::endl;
+                    pqxx::result res = txn.exec(query);
+                    if (res.size() > 0) {
+                        std::string query = "SELECT 1 FROM access WHERE booking_id = '" + std::to_string(confirmationId) + "';";
+                        std::cout << "Query: " << query << std::endl;
+                        pqxx::result res = txn.exec(query);
+                        if (res.size() == 0) {
+                            std::string randomCode = generate6DigitCode();
+                            res = txn.exec(
+                                "INSERT INTO access (booking_id, access_code) VALUES ($1, $2)",
+                                pqxx::params(
+                                    std::to_string(confirmationId),
+                                    randomCode
+                                )
+                            );
+                            txn.commit();
+                            std::cout << "Access code generated and saved to database" << std::endl;
+                            std::cout << "Query: " << query << std::endl;
+                            
+                            std::vector<unsigned char> data;
+                            data.push_back((unsigned char)randomCode.size());
+                            data.insert(data.end(), randomCode.begin(), randomCode.end());
+                            std::cout << "Access Code: " << randomCode << std::endl;
+                            auto [total_length, replyBuffer] = msg.createReply(data);
+                            std::unordered_map<uint32_t, std::string> responseMap;
+                            responseMap[msg.msg.requestID] = std::string(replyBuffer, total_length);;
+                            prevRequestData.emplace(ipStr, responseMap);
+                            sendto(socket_fd, replyBuffer, total_length, 0, (struct sockaddr *)&clientAddress, clientAddressLength);
+                            break;
+                        }
+                        else{
+                            std::cerr << "Access code already exists" << std::endl;
+                            std::vector<unsigned char> data;
+                            auto [total_length, replyBuffer] = msg.createReply(data, 1);
+                            std::unordered_map<uint32_t, std::string> responseMap;
+                            responseMap[msg.msg.requestID] = std::string(replyBuffer, total_length);
+                            prevRequestData.emplace(ipStr, responseMap);
+                            sendto(socket_fd, replyBuffer, total_length, 0, (struct sockaddr *)&clientAddress, clientAddressLength);
+                        }
+                    } else {
+                        std::cerr << "Not the user" << std::endl;
+                        std::vector<unsigned char> data;
+                        auto [total_length, replyBuffer] = msg.createReply(data, 2);
+                        std::unordered_map<uint32_t, std::string> responseMap;
+                        responseMap[msg.msg.requestID] = std::string(replyBuffer, total_length);
+                        prevRequestData.emplace(ipStr, responseMap);
+                        sendto(socket_fd, replyBuffer, total_length, 0, (struct sockaddr *)&clientAddress, clientAddressLength);
+                    }
+                    conn.close();
+                    break;
                 }
 
                 default:
                     break;
                 }
+                
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!running) break;
             }
             std::cout << "Exiting listen loop" << std::endl;
             std::cout << "Closing socket" << std::endl;
@@ -305,7 +519,7 @@ void notificationListenerThread() {
 
             std::stringstream ss((std::string(payload)));
             std::string action, facilityName;
-            int startDay, startHour, startMinute, endDay, endHour, endMinute;
+            int startDay, startHour, startMinute, endDay, endHour, endMinute, bookingStatus;
 
             std::getline(ss, action, ':');
             std::getline(ss, facilityName, ':');
@@ -320,7 +534,14 @@ void notificationListenerThread() {
             ss >> endHour;
             ss.ignore(1, ':');
             ss >> endMinute;
+            ss.ignore(1, ':');
+            ss >> bookingStatus;
 
+            if (bookingStatus != booked) {
+                std::cout << "Booking Status: " << bookingStatus << std::endl;
+                std::cout << "Booking not confirmed" << std::endl;
+                return;
+            } 
             if (action == "INSERT" || action == "UPDATE" || action == "DELETE") {
                 std::cout << "Action: " << action << std::endl;
                 std::cout << "Facility Name: " << facilityName << std::endl;
@@ -357,7 +578,9 @@ void notificationListenerThread() {
         });
 
         while (running) {
-            conn.await_notification(10);
+            if (!conn.await_notification(1)) {
+                continue;
+            }
         }
     }
     catch (const std::exception &e) {
